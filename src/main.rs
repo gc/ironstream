@@ -1,6 +1,6 @@
 use axum::{
-    extract::{Query, State},
-    http::StatusCode,
+    extract::{ws::WebSocketUpgrade, ConnectInfo, Query, State},
+    http::{HeaderMap, StatusCode},
     routing::{get, post},
     Json, Router,
 };
@@ -8,13 +8,17 @@ use chrono::{DateTime, Utc};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::{collections::HashSet, sync::Arc, time::Duration};
+use std::collections::{HashMap, HashSet};
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 use tokio::sync::{broadcast, RwLock};
+use toml;
 
 const CHANNEL_CLEANUP_INTERVAL: Duration = Duration::from_secs(900);
 const CHANNEL_INACTIVE_THRESHOLD: Duration = Duration::from_secs(600);
 const CHANNEL_CAPACITY: usize = 10;
 const MAX_CHANNELS_PER_CONNECTION: usize = 10;
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(80);
+const HEARTBEAT_MESSAGE: &str = "ping";
 
 #[derive(Clone, Deserialize, Serialize)]
 struct Message {
@@ -29,6 +33,13 @@ struct ChannelData {
     last_message: Option<DateTime<Utc>>,
 }
 
+#[derive(Clone)]
+struct ClientData {
+    ip: SocketAddr,
+    user_agent: Option<String>,
+    channels: HashSet<String>,
+}
+
 #[derive(Serialize)]
 struct ChannelStats {
     channel_id: String,
@@ -38,8 +49,16 @@ struct ChannelStats {
 }
 
 #[derive(Serialize)]
+struct ClientStats {
+    ip: String,
+    user_agent: Option<String>,
+    channels: Vec<String>,
+}
+
+#[derive(Serialize)]
 struct Stats {
     channels: Vec<ChannelStats>,
+    clients: Vec<ClientStats>,
 }
 
 #[derive(Deserialize)]
@@ -47,22 +66,58 @@ struct WsQuery {
     channels: String,
 }
 
+#[derive(Clone, Deserialize)]
+struct Config {
+    admin_token: String,
+    namespaces: HashMap<String, String>, // e.g., "dev.*" -> "token123"
+    fallback_token: String,
+}
+
 type Channels = Arc<RwLock<Vec<(String, ChannelData)>>>;
+type Clients = Arc<RwLock<Vec<ClientData>>>;
 
 async fn ws_handler(
     Query(query): Query<WsQuery>,
-    ws: axum::extract::ws::WebSocketUpgrade,
-    State((channel_state, _)): State<(Channels, String)>,
+    ws: WebSocketUpgrade,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<(Channels, Clients, Config)>,
+    headers: HeaderMap,
 ) -> Result<axum::response::Response, StatusCode> {
+    let (channel_state, client_state, _) = state;
     let channels: HashSet<String> = query.channels.split(',').map(String::from).collect();
     if channels.len() > MAX_CHANNELS_PER_CONNECTION {
         return Err(StatusCode::BAD_REQUEST);
     }
-    Ok(ws.on_upgrade(move |socket| handle_socket(socket, channels, channel_state)))
+
+    let user_agent = headers
+        .get("user-agent")
+        .and_then(|h| h.to_str().ok())
+        .map(String::from);
+
+    Ok(ws.on_upgrade(move |socket| {
+        handle_socket(
+            socket,
+            channels,
+            channel_state,
+            client_state,
+            addr,
+            user_agent,
+        )
+    }))
 }
 
-async fn stats_handler(State((channel_state, _)): State<(Channels, String)>) -> Json<Stats> {
+async fn stats_handler(
+    State(state): State<(Channels, Clients, Config)>,
+    headers: HeaderMap,
+) -> Result<Json<Stats>, StatusCode> {
+    let (channel_state, client_state, config) = state;
+    if headers.get("authorization").and_then(|h| h.to_str().ok()) != Some(&config.admin_token) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+
     let channel_read = channel_state.read().await;
+    let client_read = client_state.read().await;
+
     let channels = channel_read
         .iter()
         .map(|(id, data)| ChannelStats {
@@ -73,17 +128,29 @@ async fn stats_handler(State((channel_state, _)): State<(Channels, String)>) -> 
         })
         .collect();
 
-    Json(Stats { channels })
+    let clients = client_read
+        .iter()
+        .map(|client| ClientStats {
+            ip: client.ip.to_string(),
+            user_agent: client.user_agent.clone(),
+            channels: client.channels.iter().cloned().collect(),
+        })
+        .collect();
+
+    Ok(Json(Stats { channels, clients }))
 }
 
 async fn handle_socket(
     socket: axum::extract::ws::WebSocket,
     channel_ids: HashSet<String>,
     channel_state: Channels,
+    client_state: Clients,
+    ip: SocketAddr,
+    user_agent: Option<String>,
 ) {
     let mut receivers = Vec::new();
 
-    for channel_id in channel_ids {
+    for channel_id in channel_ids.clone() {
         let (tx, rx) = {
             let channel_read = channel_state.read().await;
             match channel_read.iter().find(|(r, _)| r == &channel_id) {
@@ -104,11 +171,15 @@ async fn handle_socket(
                 }
             }
         };
-
         receivers.push((channel_id, tx, rx));
     }
 
     let (mut ws_sender, mut ws_receiver) = socket.split();
+    client_state.write().await.push(ClientData {
+        ip,
+        user_agent,
+        channels: channel_ids.clone(),
+    });
 
     let mut send_task = tokio::spawn(async move {
         let mut combined_rx =
@@ -118,23 +189,34 @@ async fn handle_socket(
                 }))
             }));
 
-        while let Some(msg) = combined_rx.next().await {
-            if ws_sender
-                .send(axum::extract::ws::Message::Text(msg))
-                .await
-                .is_err()
-            {
-                break;
+        let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
+        loop {
+            tokio::select! {
+                Some(msg) = combined_rx.next() => {
+                    if ws_sender.send(axum::extract::ws::Message::Text(msg)).await.is_err() {
+                        break;
+                    }
+                }
+                _ = heartbeat.tick() => {
+                    if ws_sender.send(axum::extract::ws::Message::Text(HEARTBEAT_MESSAGE.to_string())).await.is_err() {
+                        break;
+                    }
+                }
             }
         }
     });
 
+    let client_state_clone = client_state.clone();
     let mut recv_task = tokio::spawn(async move {
         while let Some(Ok(msg)) = ws_receiver.next().await {
             if matches!(msg, axum::extract::ws::Message::Close(_)) {
                 break;
             }
         }
+        client_state_clone
+            .write()
+            .await
+            .retain(|client| client.ip != ip || !client.channels.is_subset(&channel_ids));
     });
 
     tokio::select! {
@@ -144,19 +226,28 @@ async fn handle_socket(
 }
 
 async fn webhook(
-    State((channel_state, auth_token)): State<(Channels, String)>,
-    headers: axum::http::HeaderMap,
+    State(state): State<(Channels, Clients, Config)>,
+    headers: HeaderMap,
     axum::extract::Path(channel_id): axum::extract::Path<String>,
     Json(payload): Json<Value>,
 ) -> StatusCode {
-    if headers.get("authorization").and_then(|h| h.to_str().ok()) != Some(&auth_token) {
+    let (channel_state, _, config) = state;
+    let auth_token = headers.get("authorization").and_then(|h| h.to_str().ok());
+
+    let valid_token = config
+        .namespaces
+        .iter()
+        .find(|(ns, _)| ns.ends_with('*') && channel_id.starts_with(&ns[..ns.len() - 1]))
+        .map(|(_, token)| token.as_str())
+        .unwrap_or(&config.fallback_token);
+
+    if auth_token != Some(valid_token) {
         return StatusCode::UNAUTHORIZED;
     }
 
     let message = serde_json::to_string(&payload).unwrap_or_default();
-
-    let mut channel_read = channel_state.write().await;
-    match channel_read.iter_mut().find(|(r, _)| r == &channel_id) {
+    let mut channel_write = channel_state.write().await;
+    match channel_write.iter_mut().find(|(r, _)| r == &channel_id) {
         Some((_, data)) => {
             data.message_count += 1;
             data.last_message = Some(Utc::now());
@@ -165,14 +256,15 @@ async fn webhook(
         }
         None => {
             let (new_tx, _) = broadcast::channel(CHANNEL_CAPACITY);
-            channel_read.push((
+            channel_write.push((
                 channel_id,
                 ChannelData {
-                    tx: new_tx,
+                    tx: new_tx.clone(),
                     message_count: 1,
                     last_message: Some(Utc::now()),
                 },
             ));
+            let _ = new_tx.send(message);
             StatusCode::CREATED
         }
     }
@@ -196,9 +288,14 @@ async fn cleanup_channels(channel_state: Channels) {
 
 #[tokio::main]
 async fn main() {
+    let config_content =
+        std::fs::read_to_string("config.toml").expect("Failed to read config.toml");
+    let config: Config = toml::from_str(&config_content).expect("Failed to parse TOML config");
+
     let channel_state: Channels = Arc::new(RwLock::new(Vec::new()));
+    let client_state: Clients = Arc::new(RwLock::new(Vec::new()));
     let cleanup_state = channel_state.clone();
-    let auth_token = std::env::var("AUTH_TOKEN").expect("AUTH_TOKEN env variable must be set");
+
     let port = std::env::var("PORT").unwrap_or_else(|_| "3131".into());
 
     tokio::spawn(async move {
@@ -213,14 +310,14 @@ async fn main() {
         .route("/ws", get(ws_handler))
         .route("/webhook/:channel_id", post(webhook))
         .route("/stats", get(stats_handler))
-        .with_state((channel_state, auth_token.clone()));
+        .with_state((channel_state, client_state, config));
 
     let url = format!("0.0.0.0:{}", port);
     println!("Listening on {}", url);
 
     axum::serve(
         tokio::net::TcpListener::bind(url).await.unwrap(),
-        app.into_make_service(),
+        app.into_make_service_with_connect_info::<SocketAddr>(),
     )
     .await
     .unwrap();
