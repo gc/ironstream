@@ -1,16 +1,22 @@
 const WebSocket = require("ws");
 
-const MESSAGES_TO_SEND = 100;
-const CLIENTS_AMOUNT = 100;
+const MESSAGES_TO_SEND = 10;
+const CLIENTS_AMOUNT = 10;
 
-const HOST = "localhost";
+const HOST = "ws.worp.tv";
 const PORT = 3131;
 const AUTH_TOKEN = "123";
 const CHANNEL_ID = "12345";
 
-const WEBHOOK_URL = `http://${HOST}:${PORT}/webhook/${CHANNEL_ID}`;
-const WS_URL = `ws://${HOST}:${PORT}/ws?channels=${CHANNEL_ID}`;
+const LOCAL = false;
+const SECURE = true;
 
+const PORT_STR = LOCAL ? `:${PORT}` : "";
+
+const WEBHOOK_URL = `http${SECURE ? 's' : ''}://${HOST}${PORT_STR}/webhook/${CHANNEL_ID}`;
+const WS_URL = `ws${SECURE ? 's' : ''}://${HOST}${PORT_STR}/ws?channels=${CHANNEL_ID}`;
+
+console.log({WEBHOOK_URL, WS_URL});
 let totalMessagesReceived = 0;
 
 for (let i = 0; i < CLIENTS_AMOUNT; i++) {
