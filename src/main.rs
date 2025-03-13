@@ -355,15 +355,25 @@ async fn webhook(
     State(state): State<Arc<AppState>>,
     Path(channel_id): Path<String>,
     Json(payload): Json<Value>,
-) -> StatusCode {
+) -> Json<Value> {
     let mut channel_write = state.channels.write().await;
     let message = serde_json::to_string(&payload).unwrap_or_default();
+    let mut sent_to = Vec::new();
+
+    {
+        let client_read = state.clients.read().await;
+        for (uuid, client) in client_read.iter() {
+            if client.channels.contains(&channel_id) {
+                sent_to.push(uuid.to_string());
+            }
+        }
+    }
+
     match channel_write.get_mut(&channel_id) {
         Some(data) => {
             data.message_count += 1;
             data.last_message = Some(Utc::now());
             let _ = data.tx.send(message);
-            StatusCode::OK
         }
         None => {
             let (new_tx, _) = broadcast::channel(10);
@@ -376,9 +386,10 @@ async fn webhook(
                 },
             );
             let _ = new_tx.send(message);
-            StatusCode::CREATED
         }
     }
+
+    Json(serde_json::json!({ "sent_to": sent_to }))
 }
 
 async fn disconnect_user(

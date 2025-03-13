@@ -1,0 +1,41 @@
+name: Build Rust Server Binary for aarch64
+
+on:
+  push:
+    branches:
+      - master
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Install Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Rust Target for ARM64
+        run: rustup target add aarch64-unknown-linux-gnu
+
+      - name: Install Dependencies for Cross Compilation
+        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
+
+      - name: Build Optimized Binary for ARM64
+        run: |
+          RUSTFLAGS="-C target-cpu=neoverse-n1 -C linker=aarch64-linux-gnu-gcc" cargo build --release --target=aarch64-unknown-linux-gnu
+
+      - name: Upload Binary as Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: websocket-server-aarch64
+          path: target/aarch64-unknown-linux-gnu/release/ironstream
+
+      - name: Upload Binary to GitHub Releases
+        if: github.ref == 'refs/heads/master'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          files: target/aarch64-unknown-linux-gnu/release/ironstream
+          token: ${{ secrets.GITHUB_TOKEN }}
