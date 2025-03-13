@@ -2,7 +2,7 @@ name: Build Rust Executable with Cross
 
 on:
   push:
-    branches: [main]
+    branches: [master]
   workflow_dispatch:
 
 jobs:
