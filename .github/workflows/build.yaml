@@ -3,7 +3,7 @@ name: Build Rust Executable with Cross
 on:
   push:
     branches: [master]
-  workflow_dispatch:
+  pull_request:
 
 jobs:
   build:
@@ -20,6 +20,7 @@ jobs:
           DOCKER_API_VERSION: 1.41
 
       - name: Upload artifact
+        if: github.ref == 'refs/heads/master' && github.event_name == 'push'
         uses: actions/upload-artifact@v4
         with:
           name: ironstream
