@@ -8,10 +8,10 @@ futures-util = "^0.3.31"
 serde_json = "^1.0.133"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
 serde = { version = "1", features = ["derive"] }
-axum = { version = "^0.7.9", features = ["ws"] }
+axum = { version = "^0.8.1", features = ["ws"] }
 chrono = { version = "^0.4.39", features = ["serde"] }
 uuid = { version = "1.0", features = ["v4"] }
-reqwest = { version = "0.11", default-features = false, features = [
+reqwest = { version = "0.12.14", default-features = false, features = [
     "json",
     "rustls-tls",
 ] }
@@ -20,3 +20,5 @@ reqwest = { version = "0.11", default-features = false, features = [
 opt-level = 3
 lto = "thin"
 codegen-units = 1
+strip = true
+panic = "abort"
