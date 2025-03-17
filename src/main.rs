@@ -112,7 +112,6 @@ struct AppState {
     rate_limit_duration: Duration,
 }
 
-// New function to read from cache
 async fn read_cache(state: &AppState, cache_key: &str) -> Option<Result<(), String>> {
     let cache_read = state.cache.read().await;
     cache_read.get(cache_key).and_then(|entry| {
@@ -124,7 +123,6 @@ async fn read_cache(state: &AppState, cache_key: &str) -> Option<Result<(), Stri
     })
 }
 
-// New function to write to cache
 async fn write_cache(state: &AppState, cache_key: String, result: Result<(), String>) {
     let mut cache_write = state.cache.write().await;
     cache_write.insert(
@@ -143,9 +141,8 @@ async fn ws_handler(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<axum::response::Response, StatusCode> {
-    let state_clone = state.clone(); // Clone state for rate limiting and API calls
+    let state_clone = state.clone();
 
-    // Simple rate limiting
     {
         let mut rate_limits = state_clone.rate_limits.write().await;
         let now = Instant::now();
@@ -167,12 +164,12 @@ async fn ws_handler(
     let cache_key = format!("{}:{}", query.channel, query.token);
     if let Some(cached_result) = read_cache(&state_clone, &cache_key).await {
         return match cached_result {
-            Ok(()) => proceed_with_socket(ws, query.channel, addr, headers, state_clone.clone()), // Clone again for socket
+            Ok(()) => proceed_with_socket(ws, query.channel, addr, headers, state_clone.clone()),
             Err(err) => {
                 let err_json = serde_json::json!({ "error": err }).to_string();
                 let ws_response = ws.on_upgrade(move |socket| async move {
                     let mut socket = socket;
-                    let _ = socket.send(WsMessage::Text(err_json)).await;
+                    let _ = socket.send(WsMessage::Text(err_json.into())).await;
                     socket.close().await.ok();
                 });
                 Ok(ws_response)
@@ -208,16 +205,15 @@ async fn ws_handler(
         Err(e) => Err(format!("API error: {}", e)),
     };
 
-    // Write to cache
     write_cache(&state_clone, cache_key.clone(), auth_result.clone()).await;
 
     match auth_result {
-        Ok(()) => proceed_with_socket(ws, query.channel, addr, headers, state_clone.clone()), // Clone again for socket
+        Ok(()) => proceed_with_socket(ws, query.channel, addr, headers, state_clone.clone()),
         Err(err) => {
             let err_json = serde_json::json!({ "error": err }).to_string();
             let ws_response = ws.on_upgrade(move |socket| async move {
                 let mut socket = socket;
-                let _ = socket.send(WsMessage::Text(err_json)).await;
+                let _ = socket.send(WsMessage::Text(err_json.into())).await;
                 socket.close().await.ok();
             });
             Ok(ws_response)
@@ -281,7 +277,7 @@ async fn handle_socket(
                 msg = rx.recv() => {
                     match msg {
                         Ok(msg) => {
-                            if ws_sender.send(WsMessage::Text(msg)).await.is_err() {
+                            if ws_sender.send(WsMessage::Text(msg.into())).await.is_err() {
                                 break;
                             }
                         }
@@ -289,7 +285,7 @@ async fn handle_socket(
                     }
                 }
                 _ = heartbeat.tick() => {
-                    if ws_sender.send(WsMessage::Text(HEARTBEAT_MESSAGE.to_string())).await.is_err() {
+                    if ws_sender.send(WsMessage::Text(HEARTBEAT_MESSAGE.into())).await.is_err() {
                         break;
                     }
                 }
@@ -319,11 +315,13 @@ async fn handle_socket(
 async fn stats_handler(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-) -> Result<Json<Stats>, StatusCode> {
+) -> (StatusCode, Json<Value>) {
     if headers.get("authorization").and_then(|h| h.to_str().ok()) != Some(&state.admin_token) {
-        return Err(StatusCode::UNAUTHORIZED);
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": "UNAUTHORIZED" })),
+        );
     }
-
     let channel_read = state.channels.read().await;
     let client_read = state.clients.read().await;
 
@@ -348,14 +346,41 @@ async fn stats_handler(
         })
         .collect();
 
-    Ok(Json(Stats { channels, clients }))
+    (
+        StatusCode::OK,
+        Json(serde_json::json!(Stats { channels, clients })),
+    )
 }
 
 async fn webhook(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Path(channel_id): Path<String>,
-    Json(payload): Json<Value>,
-) -> Json<Value> {
+    payload: Result<Json<Value>, axum::extract::rejection::JsonRejection>,
+) -> (StatusCode, Json<Value>) {
+    println!("Received webhook for channel {}", channel_id);
+    if headers.get("authorization").and_then(|h| h.to_str().ok()) != Some(&state.admin_token) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": "UNAUTHORIZED" })),
+        );
+    }
+    if headers.get("content-type").and_then(|h| h.to_str().ok()) != Some("application/json") {
+        return (
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            Json(serde_json::json!({ "error": "UNSUPPORTED_MEDIA_TYPE" })),
+        );
+    }
+
+    if payload.is_err() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "BAD_REQUEST" })),
+        );
+    }
+
+    let Json(payload) = payload.unwrap();
+
     let mut channel_write = state.channels.write().await;
     let message = serde_json::to_string(&payload).unwrap_or_default();
     let mut sent_to = Vec::new();
@@ -389,7 +414,10 @@ async fn webhook(
         }
     }
 
-    Json(serde_json::json!({ "sent_to": sent_to }))
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "sent_to": sent_to })),
+    )
 }
 
 async fn disconnect_user(
@@ -421,7 +449,6 @@ async fn disconnect_user(
 
 #[tokio::main]
 async fn main() {
-    println!("Starting ironstream");
     let admin_token = std::env::var("ADMIN_TOKEN").expect("ADMIN_TOKEN must be set");
     let api_endpoint = std::env::var("API_ENDPOINT").expect("API_ENDPOINT must be set");
     let port = std::env::var("PORT").unwrap_or_else(|_| "3131".into());
@@ -434,7 +461,6 @@ async fn main() {
         .parse::<u64>()
         .expect("RATE_LIMIT_SECONDS must be a positive integer");
 
-    println!("Finished reading env vars");
     let channels: Channels = Arc::new(RwLock::new(HashMap::new()));
     let clients: Clients = Arc::new(RwLock::new(HashMap::new()));
     let cache: Cache = Arc::new(RwLock::new(HashMap::new()));
@@ -452,12 +478,17 @@ async fn main() {
         rate_limit_duration: Duration::from_secs(rate_limit_seconds),
     });
 
-    println!("Starting router");
     let app = Router::new()
         .route("/ws", get(ws_handler))
-        .route("/broadcast/:channel_id", post(webhook))
+        .route("/broadcast/{channel_id}", post(webhook))
         .route("/admin/stats", get(stats_handler))
         .route("/admin/disconnect", post(disconnect_user))
+        .fallback(|| async {
+            (
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                Json(serde_json::json!({ "error": "UNSUPPORTED_MEDIA_TYPE" })),
+            )
+        })
         .with_state(state);
 
     let url = format!("0.0.0.0:{}", port);
@@ -469,18 +500,16 @@ async fn main() {
         .chars()
         .rev()
         .collect::<String>();
-    println!("Listening on {}", url);
-    println!("API Endpoint: {}", api_endpoint);
-    println!("Port: {}", port);
-    println!("Admin Token (last 3 chars): {}", admin_token_tail);
 
-    println!("Axum serve");
     axum::serve(
-        tokio::net::TcpListener::bind(url).await.unwrap(),
+        tokio::net::TcpListener::bind(&url).await.unwrap(),
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
     .await
     .unwrap();
 
-    println!("Finished");
+    println!("Listening on {}", &url);
+    println!("API Endpoint: {}", api_endpoint);
+    println!("Port: {}", port);
+    println!("Admin Token (last 3 chars): {}", admin_token_tail);
 }
