@@ -3,7 +3,9 @@ use axum::{
         ws::{Message as WsMessage, WebSocket, WebSocketUpgrade},
         ConnectInfo, Path, Query, State,
     },
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, Request, StatusCode},
+    middleware::{self, Next},
+    response::Response,
     routing::{get, post},
     Json, Router,
 };
@@ -135,12 +137,21 @@ async fn write_cache(state: &AppState, cache_key: String, result: Result<(), Str
 }
 
 async fn ws_handler(
-    Query(query): Query<WsQuery>,
+    query: Result<Query<WsQuery>, axum::extract::rejection::QueryRejection>,
     ws: WebSocketUpgrade,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-) -> Result<axum::response::Response, StatusCode> {
+) -> Result<axum::response::Response, (StatusCode, Json<Value>)> {
+    let query = match query {
+        Ok(q) => q.0,
+        Err(_) => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": "BAD_REQUEST" })),
+            ))
+        }
+    };
     let state_clone = state.clone();
 
     {
@@ -155,12 +166,14 @@ async fn ws_handler(
             entry.last_reset = now;
         }
         if entry.count >= state_clone.rate_limit_count {
-            return Err(StatusCode::TOO_MANY_REQUESTS);
+            return Err((
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::json!({ "error": "TOO_MANY_REQUESTS" })),
+            ));
         }
         entry.count += 1;
     }
 
-    // Check cache
     let cache_key = format!("{}:{}", query.channel, query.token);
     if let Some(cached_result) = read_cache(&state_clone, &cache_key).await {
         return match cached_result {
@@ -177,7 +190,6 @@ async fn ws_handler(
         };
     }
 
-    // API authentication
     let headers_json: HashMap<String, String> = headers
         .iter()
         .filter_map(|(k, v)| v.to_str().ok().map(|v| (k.to_string(), v.to_string())))
@@ -201,7 +213,6 @@ async fn ws_handler(
             .text()
             .await
             .unwrap_or_else(|_| "Authentication failed".to_string())),
-        // Err(_e) => Err("API error".to_string()),
         Err(e) => Err(format!("API error: {}", e)),
     };
 
@@ -227,7 +238,7 @@ fn proceed_with_socket(
     addr: SocketAddr,
     headers: HeaderMap,
     state: Arc<AppState>,
-) -> Result<axum::response::Response, StatusCode> {
+) -> Result<axum::response::Response, (StatusCode, Json<Value>)> {
     let user_agent = headers
         .get("user-agent")
         .and_then(|h| h.to_str().ok())
@@ -263,7 +274,7 @@ async fn handle_socket(
         uuid,
         ip,
         user_agent,
-        channels: channels_set.clone(),
+        channels: channels_set,
         connected_at: Utc::now(),
     };
     state.clients.write().await.insert(uuid, client_data);
@@ -275,13 +286,12 @@ async fn handle_socket(
         loop {
             tokio::select! {
                 msg = rx.recv() => {
-                    match msg {
-                        Ok(msg) => {
-                            if ws_sender.send(WsMessage::Text(msg.into())).await.is_err() {
-                                break;
-                            }
+                    if let Ok(msg) = msg {
+                        if ws_sender.send(WsMessage::Text(msg.into())).await.is_err() {
+                            break;
                         }
-                        Err(_) => break,
+                    } else {
+                        break;
                     }
                 }
                 _ = heartbeat.tick() => {
@@ -309,19 +319,10 @@ async fn handle_socket(
     tokio::select! {
         _ = &mut send_task => recv_task.abort(),
         _ = &mut recv_task => send_task.abort(),
-    };
+    }
 }
 
-async fn stats_handler(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-) -> (StatusCode, Json<Value>) {
-    if headers.get("authorization").and_then(|h| h.to_str().ok()) != Some(&state.admin_token) {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({ "error": "UNAUTHORIZED" })),
-        );
-    }
+async fn stats_handler(State(state): State<Arc<AppState>>) -> (StatusCode, Json<Value>) {
     let channel_read = state.channels.read().await;
     let client_read = state.clients.read().await;
 
@@ -334,7 +335,6 @@ async fn stats_handler(
             last_message: data.last_message,
         })
         .collect();
-
     let clients = client_read
         .iter()
         .map(|(_, client)| ClientStats {
@@ -371,20 +371,16 @@ async fn webhook(
             Json(serde_json::json!({ "error": "UNSUPPORTED_MEDIA_TYPE" })),
         );
     }
-
     if payload.is_err() {
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({ "error": "BAD_REQUEST" })),
         );
     }
-
     let Json(payload) = payload.unwrap();
-
     let mut channel_write = state.channels.write().await;
     let message = serde_json::to_string(&payload).unwrap_or_default();
     let mut sent_to = Vec::new();
-
     {
         let client_read = state.clients.read().await;
         for (uuid, client) in client_read.iter() {
@@ -393,7 +389,6 @@ async fn webhook(
             }
         }
     }
-
     match channel_write.get_mut(&channel_id) {
         Some(data) => {
             data.message_count += 1;
@@ -413,7 +408,6 @@ async fn webhook(
             let _ = new_tx.send(message);
         }
     }
-
     (
         StatusCode::OK,
         Json(serde_json::json!({ "sent_to": sent_to })),
@@ -422,15 +416,15 @@ async fn webhook(
 
 async fn disconnect_user(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
     Json(payload): Json<DisconnectPayload>,
-) -> Result<StatusCode, StatusCode> {
-    if headers.get("authorization").and_then(|h| h.to_str().ok()) != Some(&state.admin_token) {
-        return Err(StatusCode::UNAUTHORIZED);
-    }
-
+) -> Result<StatusCode, (StatusCode, Json<Value>)> {
     let mut clients = state.clients.write().await;
-    let uuid = Uuid::parse_str(&payload.uuid).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let uuid = Uuid::parse_str(&payload.uuid).map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "BAD_REQUEST" })),
+        )
+    })?;
     match clients.get_mut(&uuid) {
         Some(client) => {
             if client.channels.contains(&payload.channel) {
@@ -440,11 +434,41 @@ async fn disconnect_user(
                 }
                 Ok(StatusCode::OK)
             } else {
-                Err(StatusCode::NOT_FOUND)
+                Err((
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({ "error": "NOT_FOUND" })),
+                ))
             }
         }
-        None => Err(StatusCode::NOT_FOUND),
+        None => Err((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "NOT_FOUND" })),
+        )),
     }
+}
+
+async fn admin_auth<B>(
+    State(state): State<Arc<AppState>>,
+    req: Request<B>,
+    next: Next,
+) -> Result<Response, (StatusCode, Json<Value>)>
+where
+    B: Send + 'static,
+    axum::body::Body: From<B>,
+{
+    if req
+        .headers()
+        .get("authorization")
+        .and_then(|h| h.to_str().ok())
+        == Some(state.admin_token.as_str())
+    {
+        let req = req.map(|b| b.into());
+        return Ok(next.run(req).await);
+    }
+    Err((
+        StatusCode::UNAUTHORIZED,
+        Json(serde_json::json!({ "error": "UNAUTHORIZED" })),
+    ))
 }
 
 #[tokio::main]
@@ -480,26 +504,33 @@ async fn main() {
 
     let app = Router::new()
         .route("/ws", get(ws_handler))
-        .route("/broadcast/{channel_id}", post(webhook))
-        .route("/admin/stats", get(stats_handler))
-        .route("/admin/disconnect", post(disconnect_user))
+        .route(
+            "/broadcast/{channel_id}",
+            post(webhook).route_layer(middleware::from_fn_with_state(state.clone(), admin_auth)),
+        )
+        .route(
+            "/stats",
+            get(stats_handler)
+                .route_layer(middleware::from_fn_with_state(state.clone(), admin_auth)),
+        )
+        .route(
+            "/disconnect",
+            post(disconnect_user)
+                .route_layer(middleware::from_fn_with_state(state.clone(), admin_auth)),
+        )
         .fallback(|| async {
             (
-                StatusCode::UNSUPPORTED_MEDIA_TYPE,
-                Json(serde_json::json!({ "error": "UNSUPPORTED_MEDIA_TYPE" })),
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "NOT_FOUND" })),
             )
         })
         .with_state(state);
 
     let url = format!("0.0.0.0:{}", port);
-    let admin_token_tail = admin_token
-        .chars()
-        .rev()
-        .take(3)
-        .collect::<String>()
-        .chars()
-        .rev()
-        .collect::<String>();
+
+    println!("Listening on {}", &url);
+    println!("API Endpoint: {}", api_endpoint);
+    println!("Port: {}", port);
 
     axum::serve(
         tokio::net::TcpListener::bind(&url).await.unwrap(),
@@ -507,9 +538,4 @@ async fn main() {
     )
     .await
     .unwrap();
-
-    println!("Listening on {}", &url);
-    println!("API Endpoint: {}", api_endpoint);
-    println!("Port: {}", port);
-    println!("Admin Token (last 3 chars): {}", admin_token_tail);
 }
