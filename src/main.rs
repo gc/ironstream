@@ -20,13 +20,27 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
+use tinyrand::{RandRange, StdRand};
 use tokio::sync::{broadcast, RwLock};
-use uuid::Uuid;
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(80);
 const HEARTBEAT_MESSAGE: &str = "ping";
 const API_TIMEOUT: Duration = Duration::from_secs(2);
 const CACHE_TTL: Duration = Duration::from_secs(30);
+
+const VALID_CHARS: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+pub fn mini_id(length: usize) -> Arc<str> {
+    let mut rng = StdRand::default();
+    let mut id = String::with_capacity(length);
+    let char_count = VALID_CHARS.len();
+
+    for _ in 0..length {
+        let idx = rng.next_range(0..char_count);
+        id.push(VALID_CHARS[idx] as char);
+    }
+
+    Arc::from(id)
+}
 
 #[derive(Clone, Serialize, Deserialize)]
 struct Message {
@@ -43,16 +57,23 @@ struct ChannelData {
 
 #[derive(Clone)]
 struct ClientData {
-    uuid: Uuid,
+    id: Arc<str>,
     ip: SocketAddr,
     user_agent: Option<String>,
     channels: HashSet<String>,
     connected_at: DateTime<Utc>,
+    metadata: HashMap<String, String>,
+}
+
+#[derive(Deserialize)]
+struct AuthResponse {
+    ok: bool,
+    metadata: HashMap<String, String>,
 }
 
 #[derive(Serialize)]
 struct ChannelStats {
-    channel_id: String,
+    channel_id: Arc<str>,
     connections: usize,
     messages: usize,
     last_message: Option<DateTime<Utc>>,
@@ -60,11 +81,12 @@ struct ChannelStats {
 
 #[derive(Serialize)]
 struct ClientStats {
-    uuid: String,
+    id: Arc<str>,
     ip: String,
     user_agent: Option<String>,
     channels: Vec<String>,
     connected_at: DateTime<Utc>,
+    metadata: HashMap<String, String>,
 }
 
 #[derive(Serialize)]
@@ -81,7 +103,7 @@ struct WsQuery {
 
 #[derive(Deserialize)]
 struct DisconnectPayload {
-    uuid: String,
+    id: Arc<str>,
     channel: String,
 }
 
@@ -97,8 +119,8 @@ struct RateLimitEntry {
     last_reset: Instant,
 }
 
-type Channels = Arc<RwLock<HashMap<String, ChannelData>>>;
-type Clients = Arc<RwLock<HashMap<Uuid, ClientData>>>;
+type Channels = Arc<RwLock<HashMap<Arc<str>, ChannelData>>>;
+type Clients = Arc<RwLock<HashMap<Arc<str>, ClientData>>>;
 type Cache = Arc<RwLock<HashMap<String, CacheEntry>>>;
 type RateLimits = Arc<RwLock<HashMap<SocketAddr, RateLimitEntry>>>;
 
@@ -154,6 +176,7 @@ async fn ws_handler(
     };
     let state_clone = state.clone();
 
+    // Rate limiting logic
     {
         let mut rate_limits = state_clone.rate_limits.write().await;
         let now = Instant::now();
@@ -177,7 +200,14 @@ async fn ws_handler(
     let cache_key = format!("{}:{}", query.channel, query.token);
     if let Some(cached_result) = read_cache(&state_clone, &cache_key).await {
         return match cached_result {
-            Ok(()) => proceed_with_socket(ws, query.channel, addr, headers, state_clone.clone()),
+            Ok(()) => proceed_with_socket(
+                ws,
+                query.channel,
+                addr,
+                headers,
+                state_clone.clone(),
+                HashMap::new(),
+            ),
             Err(err) => {
                 let err_json = serde_json::json!({ "error": err }).to_string();
                 let ws_response = ws.on_upgrade(move |socket| async move {
@@ -194,6 +224,7 @@ async fn ws_handler(
         .iter()
         .filter_map(|(k, v)| v.to_str().ok().map(|v| (k.to_string(), v.to_string())))
         .collect();
+
     let auth_response = state_clone
         .http_client
         .post(&state_clone.api_endpoint)
@@ -208,43 +239,77 @@ async fn ws_handler(
         .await;
 
     let auth_result = match auth_response {
-        Ok(resp) if resp.status().is_success() => Ok(()),
-        Ok(resp) => Err(resp
-            .text()
-            .await
-            .unwrap_or_else(|_| "Authentication failed".to_string())),
-        Err(e) => Err(format!("API error: {}", e)),
+        Ok(resp) => match resp.json::<AuthResponse>().await {
+            Ok(auth_data) => {
+                if auth_data.ok {
+                    Ok(auth_data.metadata)
+                } else {
+                    Err((
+                        StatusCode::UNAUTHORIZED,
+                        Json(serde_json::json!({ "error": "Authentication failed" })),
+                    ))
+                }
+            }
+            Err(e) => Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(
+                    serde_json::json!({ "error": format!("Failed to parse auth response: {}", e) }),
+                ),
+            )),
+        },
+        Err(e) => Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": format!("API error: {}", e) })),
+        )),
     };
 
-    write_cache(&state_clone, cache_key.clone(), auth_result.clone()).await;
+    let cache_result = auth_result
+        .clone()
+        .map(|_| ())
+        .map_err(|e| e.1.get("error").unwrap().as_str().unwrap().to_string());
+    write_cache(&state_clone, cache_key.clone(), cache_result).await;
 
     match auth_result {
-        Ok(()) => proceed_with_socket(ws, query.channel, addr, headers, state_clone.clone()),
-        Err(err) => {
-            let err_json = serde_json::json!({ "error": err }).to_string();
-            let ws_response = ws.on_upgrade(move |socket| async move {
-                let mut socket = socket;
-                let _ = socket.send(WsMessage::Text(err_json.into())).await;
-                socket.close().await.ok();
-            });
-            Ok(ws_response)
-        }
+        Ok(metadata) => proceed_with_socket(
+            ws,
+            query.channel,
+            addr,
+            headers,
+            state_clone.clone(),
+            metadata,
+        ),
+        Err(err) => match err.0 {
+            StatusCode::UNAUTHORIZED
+            | StatusCode::SERVICE_UNAVAILABLE
+            | StatusCode::INTERNAL_SERVER_ERROR => {
+                let err_json = err.1.to_string();
+                let ws_response = ws.on_upgrade(move |socket| async move {
+                    let mut socket = socket;
+                    let _ = socket.send(WsMessage::Text(err_json.into())).await;
+                    socket.close().await.ok();
+                });
+                Ok(ws_response)
+            }
+            _ => Err(err),
+        },
     }
 }
-
 fn proceed_with_socket(
     ws: WebSocketUpgrade,
     channel: String,
     addr: SocketAddr,
     headers: HeaderMap,
     state: Arc<AppState>,
+    metadata: HashMap<String, String>,
 ) -> Result<axum::response::Response, (StatusCode, Json<Value>)> {
     let user_agent = headers
         .get("user-agent")
         .and_then(|h| h.to_str().ok())
         .map(String::from);
-    let uuid = Uuid::new_v4();
-    Ok(ws.on_upgrade(move |socket| handle_socket(socket, channel, state, addr, user_agent, uuid)))
+    let id = mini_id(8);
+    Ok(ws.on_upgrade(move |socket| {
+        handle_socket(socket, channel, state, addr, user_agent, id, metadata)
+    }))
 }
 
 async fn handle_socket(
@@ -253,11 +318,13 @@ async fn handle_socket(
     state: Arc<AppState>,
     ip: SocketAddr,
     user_agent: Option<String>,
-    uuid: Uuid,
+    id: Arc<str>,
+    metadata: HashMap<String, String>,
 ) {
     let (_tx, rx) = {
         let mut channel_write = state.channels.write().await;
-        let entry = channel_write.entry(channel.clone()).or_insert_with(|| {
+        let channel_key: Arc<str> = Arc::from(channel.as_str());
+        let entry = channel_write.entry(channel_key.clone()).or_insert_with(|| {
             let (tx, _) = broadcast::channel(10);
             ChannelData {
                 tx,
@@ -271,13 +338,14 @@ async fn handle_socket(
     let mut channels_set = HashSet::new();
     channels_set.insert(channel.clone());
     let client_data = ClientData {
-        uuid,
+        id: id.clone(),
         ip,
         user_agent,
         channels: channels_set,
         connected_at: Utc::now(),
+        metadata,
     };
-    state.clients.write().await.insert(uuid, client_data);
+    state.clients.write().await.insert(id.clone(), client_data);
 
     let (mut ws_sender, mut ws_receiver) = socket.split();
     let mut send_task = tokio::spawn(async move {
@@ -304,7 +372,7 @@ async fn handle_socket(
     });
 
     let state_clone = state.clone();
-    let uuid_clone = uuid;
+    let id_clone = id.clone();
     let mut recv_task = tokio::spawn(async move {
         while let Some(msg) = ws_receiver.next().await {
             match msg {
@@ -313,7 +381,7 @@ async fn handle_socket(
                 Err(_) => break,
             }
         }
-        state_clone.clients.write().await.remove(&uuid_clone);
+        state_clone.clients.write().await.remove(&id_clone);
     });
 
     tokio::select! {
@@ -338,11 +406,12 @@ async fn stats_handler(State(state): State<Arc<AppState>>) -> (StatusCode, Json<
     let clients = client_read
         .iter()
         .map(|(_, client)| ClientStats {
-            uuid: client.uuid.to_string(),
+            id: client.id.clone(),
             ip: client.ip.to_string(),
             user_agent: client.user_agent.clone(),
             channels: client.channels.iter().cloned().collect(),
             connected_at: client.connected_at,
+            metadata: client.metadata.clone(),
         })
         .collect();
 
@@ -389,7 +458,8 @@ async fn webhook(
             }
         }
     }
-    match channel_write.get_mut(&channel_id) {
+    let channel_key = Arc::from(channel_id.as_str());
+    match channel_write.get_mut(&channel_key) {
         Some(data) => {
             data.message_count += 1;
             data.last_message = Some(Utc::now());
@@ -398,7 +468,7 @@ async fn webhook(
         None => {
             let (new_tx, _) = broadcast::channel(10);
             channel_write.insert(
-                channel_id.clone(),
+                channel_key,
                 ChannelData {
                     tx: new_tx.clone(),
                     message_count: 1,
@@ -419,18 +489,12 @@ async fn disconnect_user(
     Json(payload): Json<DisconnectPayload>,
 ) -> Result<StatusCode, (StatusCode, Json<Value>)> {
     let mut clients = state.clients.write().await;
-    let uuid = Uuid::parse_str(&payload.uuid).map_err(|_| {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "error": "BAD_REQUEST" })),
-        )
-    })?;
-    match clients.get_mut(&uuid) {
+    match clients.get_mut(&payload.id) {
         Some(client) => {
             if client.channels.contains(&payload.channel) {
                 client.channels.remove(&payload.channel);
                 if client.channels.is_empty() {
-                    clients.remove(&uuid);
+                    clients.remove(&payload.id);
                 }
                 Ok(StatusCode::OK)
             } else {
