@@ -20,7 +20,8 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
-use tinyrand::{RandRange, StdRand};
+use tinyrand::RandRange;
+use tinyrand_std::thread_rand;
 use tokio::sync::{broadcast, RwLock};
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(80);
@@ -30,7 +31,7 @@ const CACHE_TTL: Duration = Duration::from_secs(30);
 
 const VALID_CHARS: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 pub fn mini_id(length: usize) -> Arc<str> {
-    let mut rng = StdRand::default();
+    let mut rng = thread_rand();
     let mut id = String::with_capacity(length);
     let char_count = VALID_CHARS.len();
 
