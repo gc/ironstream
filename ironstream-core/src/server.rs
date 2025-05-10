@@ -1,4 +1,4 @@
-use axum::{Json, Router, http::StatusCode, routing::get};
+use axum::{Router, http::StatusCode, routing::get};
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use crate::api::routes;
