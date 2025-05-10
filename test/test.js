@@ -3,18 +3,18 @@ const WebSocket = require("ws");
 const MESSAGES_TO_SEND = 10;
 const CLIENTS_AMOUNT = 10;
 
-const HOST = "ws.worp.tv";
+const HOST = "0.0.0.0";
 const PORT = 3131;
 const AUTH_TOKEN = "123";
 const CHANNEL_ID = "12345";
 
-const LOCAL = false;
-const SECURE = true;
+const LOCAL = true;
+const SECURE = false;
 
 const PORT_STR = LOCAL ? `:${PORT}` : "";
 
-const WEBHOOK_URL = `http${SECURE ? 's' : ''}://${HOST}${PORT_STR}/webhook/${CHANNEL_ID}`;
-const WS_URL = `ws${SECURE ? 's' : ''}://${HOST}${PORT_STR}/ws?channels=${CHANNEL_ID}`;
+const WEBHOOK_URL = `http${SECURE ? 's' : ''}://${HOST}${PORT_STR}/broadcast/${CHANNEL_ID}`;
+const WS_URL = `ws${SECURE ? 's' : ''}://${HOST}${PORT_STR}/ws`;
 
 console.log({WEBHOOK_URL, WS_URL});
 let totalMessagesReceived = 0;
@@ -36,7 +36,7 @@ async function sendWebhook(data) {
 		method: "POST",
 		body: JSON.stringify(data),
 		headers: {
-			Authorization: `${AUTH_TOKEN}`,
+			Authorization: AUTH_TOKEN,
 			"Content-Type": "application/json",
 		},
 	});
