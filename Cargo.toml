@@ -49,3 +49,8 @@ lto = "thin"
 codegen-units = 1
 strip = true
 panic = "abort"
+
+[workspace.dev-dependencies]
+mockito = "1.0"
+tower-test = "0.4"
+tokio-tungstenite = "0.18"

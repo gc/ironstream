@@ -1,7 +1,7 @@
 use axum::{
-    extract::{ws::WebSocketUpgrade, ConnectInfo, Query, State},
-    http::{HeaderMap, StatusCode},
     Json,
+    extract::{ConnectInfo, Query, State, ws::WebSocketUpgrade},
+    http::{HeaderMap, StatusCode},
 };
 use serde_json::Value;
 use std::{collections::HashMap, net::SocketAddr, sync::Arc};
@@ -24,7 +24,7 @@ pub async fn ws_handler(
             return Err((
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({ "error": "BAD_REQUEST" })),
-            ))
+            ));
         }
     };
 

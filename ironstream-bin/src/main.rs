@@ -20,27 +20,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .parse::<u64>()
         .expect("IRONSTREAM_RATE_LIMIT_SECONDS must be a valid number");
 
-    let port = env::var("IRONSTREAM_PORT").ok();
+    let port: u16 = env::var("IRONSTREAM_PORT")
+        .ok()
+        .and_then(|p| p.parse::<u16>().ok())
+        .unwrap_or(3113);
 
     let server = Server::new(
         admin_token.clone(),
         api_endpoint.clone(),
         rate_limit_count,
         rate_limit_seconds,
-        port.clone(),
+        Some(port),
     );
 
     println!("Starting server...");
-    server.run().await?;
 
     println!(
         "Admin Token: {}
 API Endpoint: {}
-Port: {:?}",
-        admin_token,
-        api_endpoint,
-        port.unwrap_or("no port".to_string())
+Port: {}",
+        admin_token, api_endpoint, port
     );
+
+    server.run().await?;
 
     Ok(())
 }

@@ -1,28 +1,36 @@
 use axum::{
+    Json,
     extract::{Path, State},
     http::{HeaderMap, StatusCode},
-    Json,
 };
 use chrono::Utc;
 use serde_json::Value;
 use std::sync::Arc;
 use tokio::sync::broadcast;
 
-use crate::state::AppState;
+use crate::{
+    api::types::{ApiResponse, ApiResult},
+    state::AppState,
+};
+
+#[derive(serde::Serialize)]
+pub struct BroadcastResponse {
+    sent_to: Vec<String>,
+}
 
 pub async fn webhook_handler(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(channel_id): Path<String>,
     payload: Result<Json<Value>, axum::extract::rejection::JsonRejection>,
-) -> (StatusCode, Json<Value>) {
+) -> (StatusCode, ApiResult<BroadcastResponse>) {
     // tracing::info!("Received webhook for channel {}", channel_id);
 
     // Check authorization
     if headers.get("authorization").and_then(|h| h.to_str().ok()) != Some(&state.admin_token) {
         return (
             StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({ "error": "UNAUTHORIZED" })),
+            ApiResult(ApiResponse::error("UNAUTHORIZED")),
         );
     }
 
@@ -30,7 +38,7 @@ pub async fn webhook_handler(
     if headers.get("content-type").and_then(|h| h.to_str().ok()) != Some("application/json") {
         return (
             StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            Json(serde_json::json!({ "error": "UNSUPPORTED_MEDIA_TYPE" })),
+            ApiResult(ApiResponse::error("UNSUPPORTED_MEDIA_TYPE")),
         );
     }
 
@@ -38,7 +46,7 @@ pub async fn webhook_handler(
     if payload.is_err() {
         return (
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "error": "BAD_REQUEST" })),
+            ApiResult(ApiResponse::error("BAD_REQUEST")),
         );
     }
 
@@ -81,6 +89,6 @@ pub async fn webhook_handler(
 
     (
         StatusCode::OK,
-        Json(serde_json::json!({ "sent_to": sent_to })),
+        ApiResult(ApiResponse::success(BroadcastResponse { sent_to })),
     )
 }
