@@ -29,6 +29,13 @@ reqwest = { version = "0.12.14", default-features = false, features = [
 tinyrand = "0.5.0"
 tinyrand-std = "0.5.0"
 
+[dev-dependencies]
+mockito = "1.0"
+tower-test = "0.4"
+tokio-tungstenite = "0.18"
+hyper = "0.14"
+http-body = "0.4"
+
 [profile.release]
 opt-level = 3
 lto = "thin"
