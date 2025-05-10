@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use tinyrand::{Rand, RandRange};
+use tinyrand::RandRange;
 use tinyrand_std::thread_rand;
 
 const VALID_CHARS: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";

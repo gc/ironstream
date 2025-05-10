@@ -1,23 +1,21 @@
 use axum::{
+    Json,
+    body::Body,
     extract::State,
     http::{Request, StatusCode},
     middleware::Next,
     response::Response,
-    Json,
 };
 use serde_json::Value;
 use std::sync::Arc;
 
 use crate::state::AppState;
 
-pub async fn admin_auth<B>(
+pub async fn admin_auth(
     State(state): State<Arc<AppState>>,
-    req: Request<B>,
-    next: Next<B>,
-) -> Result<Response, (StatusCode, Json<Value>)>
-where
-    B: Send + 'static,
-{
+    req: Request<Body>,
+    next: Next,
+) -> Result<Response, (StatusCode, Json<Value>)> {
     if req
         .headers()
         .get("authorization")

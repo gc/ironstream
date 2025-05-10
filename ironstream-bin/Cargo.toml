@@ -1,0 +1,15 @@
+[package]
+name = "ironstream-bin"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+ironstream-core = { path = "../ironstream-core" }
+tokio.workspace = true
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true

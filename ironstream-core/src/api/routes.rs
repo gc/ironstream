@@ -1,14 +1,13 @@
 use axum::{
-    middleware,
+    Router, middleware,
     routing::{get, post},
-    Router,
 };
 use std::sync::Arc;
 
 use super::{handlers, middleware::admin_auth, webhook};
 use crate::state::AppState;
 
-pub fn configure_api_routes(state: Arc<AppState>) -> Router {
+pub fn configure_api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
     Router::new()
         .route(
             "/stats",

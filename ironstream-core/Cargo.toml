@@ -1,0 +1,23 @@
+[package]
+name = "ironstream-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+futures-util.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+serde.workspace = true
+axum.workspace = true
+chrono.workspace = true
+reqwest.workspace = true
+tinyrand.workspace = true
+tinyrand-std.workspace = true
+http-body.workspace = true
+hyper.workspace = true
+
+[dev-dependencies]
+mockito.workspace = true
+tower-test.workspace = true
+tokio-tungstenite.workspace = true
